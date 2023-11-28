@@ -14,8 +14,9 @@ var (
 )
 
 const (
-	DataFileNameSuffix = ".data"
-	HintFileName       = "hint-index"
+	DataFileNameSuffix    = ".data"
+	HintFileName          = "hint-index"
+	MergeFinishedFileName = "merge-finished"
 )
 
 // DataFile 数据文件
@@ -35,6 +36,12 @@ func OpenDataFile(dirPath string, fileId uint32) (*DataFile, error) {
 // OpenHintFile 打开 hint 索引文件
 func OpenHintFile(dirPath string) (*DataFile, error) {
 	fileName := filepath.Join(dirPath, HintFileName)
+	return newDataFile(fileName, 0)
+}
+
+// OpenMergeFinishedFile 打开标识 merge 完成的文件
+func OpenMergeFinishedFile(dirPath string) (*DataFile, error) {
+	fileName := filepath.Join(dirPath, MergeFinishedFileName)
 	return newDataFile(fileName, 0)
 }
 

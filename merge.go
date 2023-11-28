@@ -7,9 +7,13 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 )
 
-const mergeDirName = "merge"
+const (
+	mergeDirName     = "merge"
+	mergeFinishedKey = "merge.finished"
+)
 
 // Merge 清理无效数据，生成 Hint 文件
 func (db *DB) Merge() error {
@@ -40,6 +44,9 @@ func (db *DB) Merge() error {
 		db.mu.Unlock()
 		return err
 	}
+	// 记录最近没有参与 merge 的文件 id
+	nonMergeFileId := db.activeFile.FileId
+
 	// 取出所有需要 merge 的文件
 	var mergeFiles []*data.DataFile
 	for _, file := range db.olderFiles {
@@ -109,6 +116,34 @@ func (db *DB) Merge() error {
 			offset += size
 		}
 	}
+
+	// Sync 保证持久化
+	if err := hintFile.Sync(); err != nil {
+		return err
+	}
+	if err := mergeDB.Sync(); err != nil {
+		return err
+	}
+
+	// 写标识 merge 完成的文件
+	mergeFinishedFile, err := data.OpenMergeFinishedFile(mergePath)
+	if err != nil {
+		return err
+	}
+
+	mergeFinRecord := &data.LogRecord{
+		Key:   []byte(mergeFinishedKey),
+		Value: []byte(strconv.Itoa(int(nonMergeFileId))),
+	}
+	encRecord, _ := data.EncodeLogRecord(mergeFinRecord)
+	if err := mergeFinishedFile.Write(encRecord); err != nil {
+		return err
+	}
+	if err := mergeFinishedFile.Sync(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (db *DB) getMergePath() string {
