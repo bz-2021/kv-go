@@ -20,6 +20,8 @@ type DB struct {
 	activeFile *data.DataFile            // 当前的活跃文件
 	olderFiles map[uint32]*data.DataFile // 旧的数据文件，只能用来读
 	index      index.Indexer
+	seqNo      uint64 // 事务序列号，全局递增
+	isMerging  bool   // 是否正在 Merge
 }
 
 // Open 打开 bitcask 存储引擎实例
@@ -98,13 +100,13 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 	// 构造 LogRecord 结构体
 	log_record := &data.LogRecord{
-		Key:   key,
+		Key:   logRecordKeyWithSeq(key, nonTransactionSeqNo),
 		Value: value,
 		Type:  data.LogRecordNormal,
 	}
 
 	// 追加写入到当前活跃的文件当中
-	pos, err := db.appendLogRecord(log_record)
+	pos, err := db.appendLogRecordWithLock(log_record)
 	if err != nil {
 		return err
 	}
@@ -127,9 +129,12 @@ func (db *DB) Delete(key []byte) error {
 		return nil
 	}
 	// 构造 LogRecord, 标识被删除
-	logRecord := &data.LogRecord{Key: key, Type: data.LogRecordDeleted}
+	logRecord := &data.LogRecord{
+		Key:  logRecordKeyWithSeq(key, nonTransactionSeqNo),
+		Type: data.LogRecordDeleted,
+	}
 	// 写入到数据文件
-	_, err := db.appendLogRecord(logRecord)
+	_, err := db.appendLogRecordWithLock(logRecord)
 	if err != nil {
 		return nil
 	}
@@ -225,9 +230,14 @@ func (db *DB) getValueByPosition(logRecordPos *data.LogRecordPos) ([]byte, error
 }
 
 // appendLogRecord 追加写数据到活跃文件中
-func (db *DB) appendLogRecord(logRecord *data.LogRecord) (*data.LogRecordPos, error) {
+func (db *DB) appendLogRecordWithLock(logRecord *data.LogRecord) (*data.LogRecordPos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	return db.appendLogRecord(logRecord)
+}
+
+// appendLogRecord 追加写数据到活跃文件中
+func (db *DB) appendLogRecord(logRecord *data.LogRecord) (*data.LogRecordPos, error) {
 
 	// 判断当前活跃的数据文件是否存在
 	// 如果为空则初始化数据文件
@@ -292,16 +302,6 @@ func (db *DB) setActiveDataFile() error {
 	return nil
 }
 
-func checkOptions(options Options) error {
-	if options.DirPath == "" {
-		return errors.New("database dir path is empty")
-	}
-	if options.DataFileSize <= 0 {
-		return errors.New("database data file must be greater than 0")
-	}
-	return nil
-}
-
 // 从磁盘中加载数据文件
 func (db *DB) loadDataFiles() error {
 	dirEntries, err := os.ReadDir(db.option.DirPath)
@@ -349,7 +349,23 @@ func (db *DB) loadIndexFromDataFiles() error {
 		return nil
 	}
 
-	// 遍历取出文件的内容
+	updateIndex := func(key []byte, typ data.LogRecordType, pos *data.LogRecordPos) {
+		var ok bool
+		if typ == data.LogRecordDeleted {
+			ok = db.index.Delete(key)
+		} else {
+			ok = db.index.Put(key, pos)
+		}
+		if !ok {
+			panic("failed to update index at startup")
+		}
+	}
+
+	// 暂存事务数据
+	transactionRecords := make(map[uint64][]*data.TransactionRecord)
+	var currentSeqNo uint64 = nonTransactionSeqNo
+
+	// 遍历所有的文件 id，处理文件中的记录
 	for i, fid := range db.fileIds {
 		var fileId = uint32(fid)
 		var dataFile *data.DataFile
@@ -370,16 +386,33 @@ func (db *DB) loadIndexFromDataFiles() error {
 				return err
 			}
 
-			// 保存到内存索引
+			// 构造内存索引并保存
 			logRecordPos := &data.LogRecordPos{Fid: fileId, Offset: offset}
-			var ok bool
-			if logRecord.Type == data.LogRecordDeleted {
-				ok = db.index.Delete(logRecord.Key)
+
+			// 解析 key，拿到事务序列号
+			realKey, seqNo := parseLogRecordKey(logRecord.Key)
+			if seqNo == nonTransactionSeqNo {
+				// 非事务操作，直接更新内存索引
+				updateIndex(realKey, logRecord.Type, logRecordPos)
 			} else {
-				ok = db.index.Put(logRecord.Key, logRecordPos)
+				// 事务完成，直接更新内存索引
+				if logRecord.Type == data.LogRecordTxnFinished {
+					for _, txnRecord := range transactionRecords[seqNo] {
+						updateIndex(txnRecord.Record.Key, txnRecord.Record.Type, txnRecord.Pos)
+					}
+					delete(transactionRecords, seqNo)
+				} else {
+					logRecord.Key = realKey
+					transactionRecords[seqNo] = append(transactionRecords[seqNo], &data.TransactionRecord{
+						Record: logRecord,
+						Pos:    logRecordPos,
+					})
+				}
 			}
-			if !ok {
-				return ErrIndexUpdateFailed
+
+			// 更新事务序列号
+			if seqNo > currentSeqNo {
+				currentSeqNo = seqNo
 			}
 
 			// 递增 offset，下一次从新位置开始读取
@@ -390,6 +423,20 @@ func (db *DB) loadIndexFromDataFiles() error {
 		if i == len(db.fileIds)-1 {
 			db.activeFile.WriteOff = offset
 		}
+	}
+
+	// 更新事务序列号
+	db.seqNo = currentSeqNo
+
+	return nil
+}
+
+func checkOptions(options Options) error {
+	if options.DirPath == "" {
+		return errors.New("database dir path is empty")
+	}
+	if options.DataFileSize <= 0 {
+		return errors.New("database data file must be greater than 0")
 	}
 	return nil
 }
